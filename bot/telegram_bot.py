@@ -688,13 +688,82 @@ class ChatGPTTelegramBot:
                     message_thread_id=get_thread_id(update)
                 )
 
-                # Since GeminiHelper doesn't support streaming yet, we'll just get the full response.
-                response, total_tokens = await self.model_helper.get_chat_response(chat_id=chat_id, query=prompt)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    text=response,
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
+                stream_response = self.model_helper.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                i = 0
+                prev = ''
+                sent_message = None
+                backoff = 0
+                stream_chunk = 0
+
+                async for content, tokens in stream_response:
+                    if is_direct_result(content):
+                        return await handle_direct_result(self.config, update, content)
+
+                    if len(content.strip()) == 0:
+                        continue
+
+                    stream_chunks = split_into_chunks(content)
+                    if len(stream_chunks) > 1:
+                        content = stream_chunks[-1]
+                        if stream_chunk != len(stream_chunks) - 1:
+                            stream_chunk += 1
+                            try:
+                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                              stream_chunks[-2])
+                            except:
+                                pass
+                            try:
+                                sent_message = await update.effective_message.reply_text(
+                                    message_thread_id=get_thread_id(update),
+                                    text=content if len(content) > 0 else "..."
+                                )
+                            except:
+                                pass
+                            continue
+
+                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            if sent_message is not None:
+                                await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                 message_id=sent_message.message_id)
+                            sent_message = await update.effective_message.reply_text(
+                                message_thread_id=get_thread_id(update),
+                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                text=content,
+                            )
+                        except:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+
+                        try:
+                            use_markdown = tokens != 'not_finished'
+                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                          text=content, markdown=use_markdown)
+
+                        except RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+
+                        except TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        except Exception:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
             else:
                 async def _reply():
                     nonlocal total_tokens
@@ -815,35 +884,96 @@ class ChatGPTTelegramBot:
                                                   is_inline=True)
                     return
 
-                async def _send_inline_query_response():
-                    nonlocal total_tokens
-                    # Edit the current message to indicate that the answer is being processed
-                    await context.bot.edit_message_text(inline_message_id=inline_message_id,
-                                                        text=f'{query}\n\n_{answer_tr}:_\n{loading_tr}',
-                                                        parse_mode=constants.ParseMode.MARKDOWN)
+                unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
+                if self.config['stream']:
+                    stream_response = self.model_helper.get_chat_response_stream(chat_id=user_id, query=query)
+                    i = 0
+                    prev = ''
+                    backoff = 0
+                    async for content, tokens in stream_response:
+                        if is_direct_result(content):
+                            cleanup_intermediate_files(content)
+                            await edit_message_with_retry(context, chat_id=None,
+                                                          message_id=inline_message_id,
+                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                          is_inline=True)
+                            return
 
-                    logging.info(f'Generating response for inline query by {name}')
-                    response, total_tokens = await self.model_helper.get_chat_response(chat_id=user_id, query=query)
+                        if len(content.strip()) == 0:
+                            continue
 
-                    if is_direct_result(response):
-                        cleanup_intermediate_files(response)
-                        await edit_message_with_retry(context, chat_id=None,
-                                                      message_id=inline_message_id,
-                                                      text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
-                                                      is_inline=True)
-                        return
+                        cutoff = get_stream_cutoff_values(update, content)
+                        cutoff += backoff
 
-                    text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
+                        if i == 0:
+                            try:
+                                await edit_message_with_retry(context, chat_id=None,
+                                                              message_id=inline_message_id,
+                                                              text=f'{query}\n\n{answer_tr}:\n{content}',
+                                                              is_inline=True)
+                            except:
+                                continue
 
-                    # We only want to send the first 4096 characters. No chunking allowed in inline mode.
-                    text_content = text_content[:4096]
+                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                            prev = content
+                            try:
+                                use_markdown = tokens != 'not_finished'
+                                divider = '_' if use_markdown else ''
+                                text = f'{query}\n\n{divider}{answer_tr}:{divider}\n{content}'
 
-                    # Edit the original message with the generated content
-                    await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                  text=text_content, is_inline=True)
+                                # We only want to send the first 4096 characters. No chunking allowed in inline mode.
+                                text = text[:4096]
 
-                await wrap_with_indicator(update, context, _send_inline_query_response,
-                                          constants.ChatAction.TYPING, is_inline=True)
+                                await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                                              text=text, markdown=use_markdown, is_inline=True)
+
+                            except RetryAfter as e:
+                                backoff += 5
+                                await asyncio.sleep(e.retry_after)
+                                continue
+                            except TimedOut:
+                                backoff += 5
+                                await asyncio.sleep(0.5)
+                                continue
+                            except Exception:
+                                backoff += 5
+                                continue
+
+                            await asyncio.sleep(0.01)
+
+                        i += 1
+                        if tokens != 'not_finished':
+                            total_tokens = int(tokens)
+                else:
+                    async def _send_inline_query_response():
+                        nonlocal total_tokens
+                        # Edit the current message to indicate that the answer is being processed
+                        await context.bot.edit_message_text(inline_message_id=inline_message_id,
+                                                            text=f'{query}\n\n_{answer_tr}:_\n{loading_tr}',
+                                                            parse_mode=constants.ParseMode.MARKDOWN)
+
+                        logging.info(f'Generating response for inline query by {name}')
+                        response, total_tokens = await self.model_helper.get_chat_response(chat_id=user_id, query=query)
+
+                        if is_direct_result(response):
+                            cleanup_intermediate_files(response)
+                            await edit_message_with_retry(context, chat_id=None,
+                                                          message_id=inline_message_id,
+                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                          is_inline=True)
+                            return
+
+                        text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
+
+                        # We only want to send the first 4096 characters. No chunking allowed in inline mode.
+                        text_content = text_content[:4096]
+
+                        # Edit the original message with the generated content
+                        await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                                      text=text_content, is_inline=True)
+
+                    await wrap_with_indicator(update, context, _send_inline_query_response,
+                                              constants.ChatAction.TYPING, is_inline=True)
 
                 add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
 

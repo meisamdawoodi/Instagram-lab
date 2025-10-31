@@ -16,6 +16,7 @@ class GeminiHelper:
         api_key = config.get('api_key')
         if not api_key:
             raise ValueError("Gemini API key is missing from the configuration.")
+        genai.configure(api_key=api_key)
 
         # The user wants to use Gemini 1.5 Pro, but the model name in the API might be different.
         # Let's use 'gemini-1.5-pro-latest' for now.
@@ -74,3 +75,38 @@ class GeminiHelper:
 
         token_count = await self.model.count_tokens_async(self.conversations[chat_id])
         return len(self.conversations[chat_id]), token_count.total_tokens
+
+    async def get_chat_response_stream(self, chat_id: int, query: str):
+        """
+        Stream response from the Gemini model.
+        :param chat_id: The chat ID
+        :param query: The query to send to the model
+        :return: The answer from the model and the number of tokens used, or 'not_finished'
+        """
+        logging.info(f"Getting chat response for chat_id: {chat_id} with query: {query}")
+
+        if chat_id not in self.conversations:
+            self.conversations[chat_id] = []
+
+        try:
+            # Start a chat session with the history
+            chat = self.model.start_chat(history=self.conversations.get(chat_id, []))
+
+            # Send the new message and stream the response
+            response_stream = await chat.send_message_async(query, stream=True)
+
+            answer = ''
+            async for chunk in response_stream:
+                if chunk.text:
+                    answer += chunk.text
+                    yield answer, 'not_finished'
+
+            # Update the conversation history
+            self.conversations[chat_id] = chat.history
+
+            token_count = await self.model.count_tokens_async(chat.history)
+            yield answer, str(token_count.total_tokens)
+
+        except Exception as e:
+            logging.error(f"Error getting response from Gemini: {e}")
+            raise Exception(f"⚠️ An error occurred while communicating with Gemini. ⚠️\n{str(e)}") from e
